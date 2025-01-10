@@ -1,33 +1,93 @@
 import shutil
 import subprocess
 import sys
+from unittest.mock import Mock
 
-import pytest  # type: ignore
+import pytest  # type: ignore[import-not-found]
 
 import pipx.interpreter
+import pipx.paths
+import pipx.standalone_python
+from pipx.constants import WINDOWS
 from pipx.interpreter import (
+    InterpreterResolutionError,
     _find_default_windows_python,
     _get_absolute_python_interpreter,
+    find_python_interpreter,
 )
 from pipx.util import PipxError
 
+original_which = shutil.which
 
-def test_windows_python_venv_present(monkeypatch):
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Looks for Python.exe")
+@pytest.mark.parametrize("venv", [True, False])
+def test_windows_python_with_version(monkeypatch, venv):
+    def which(name):
+        if name == "py":
+            return "py"
+        return original_which(name)
+
+    major = sys.version_info.major
+    minor = sys.version_info.minor
+    monkeypatch.setattr(pipx.interpreter, "has_venv", lambda: venv)
+    monkeypatch.setattr(shutil, "which", which)
+    python_path = find_python_interpreter(f"{major}.{minor}")
+    assert python_path is not None
+    assert f"{major}.{minor}" in python_path or f"{major}{minor}" in python_path
+    assert python_path.endswith("python.exe")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Looks for Python.exe")
+@pytest.mark.parametrize("venv", [True, False])
+def test_windows_python_with_python_and_version(monkeypatch, venv):
+    def which(name):
+        if name == "py":
+            return "py"
+        return original_which(name)
+
+    major = sys.version_info.major
+    minor = sys.version_info.minor
+    monkeypatch.setattr(pipx.interpreter, "has_venv", lambda: venv)
+    monkeypatch.setattr(shutil, "which", which)
+    python_path = find_python_interpreter(f"python{major}.{minor}")
+    assert python_path is not None
+    assert f"{major}.{minor}" in python_path or f"{major}{minor}" in python_path
+    assert python_path.endswith("python.exe")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Looks for Python.exe")
+@pytest.mark.parametrize("venv", [True, False])
+def test_windows_python_with_python_and_unavailable_version(monkeypatch, venv):
+    def which(name):
+        if name == "py":
+            return "py"
+        return original_which(name)
+
+    major = sys.version_info.major + 99
+    minor = sys.version_info.minor
+    monkeypatch.setattr(pipx.interpreter, "has_venv", lambda: venv)
+    monkeypatch.setattr(shutil, "which", which)
+    with pytest.raises(InterpreterResolutionError) as e:
+        find_python_interpreter(f"python{major}.{minor}")
+        assert "py --list" in str(e)
+
+
+def test_windows_python_no_version_with_venv(monkeypatch):
     monkeypatch.setattr(pipx.interpreter, "has_venv", lambda: True)
     assert _find_default_windows_python() == sys.executable
 
 
-def test_windows_python_no_venv_py_present(monkeypatch):
+def test_windows_python_no_version_no_venv_with_py(monkeypatch):
     def which(name):
-        if name == "py":
-            return "py"
+        return "py"
 
     monkeypatch.setattr(pipx.interpreter, "has_venv", lambda: False)
     monkeypatch.setattr(shutil, "which", which)
     assert _find_default_windows_python() == "py"
 
 
-def test_windows_python_no_venv_python_present(monkeypatch):
+def test_windows_python_no_version_no_venv_python_present(monkeypatch):
     def which(name):
         if name == "python":
             return "python"
@@ -38,7 +98,7 @@ def test_windows_python_no_venv_python_present(monkeypatch):
     assert _find_default_windows_python() == "python"
 
 
-def test_windows_python_no_venv_no_python(monkeypatch):
+def test_windows_python_no_version_no_venv_no_python(monkeypatch):
     def which(name):
         return None
 
@@ -60,10 +120,7 @@ def test_windows_python_no_venv_store_python(monkeypatch):
             self.out = out
 
         def __call__(self, *args, **kw):
-            class Ret:
-                pass
-
-            ret = Ret()
+            ret = Mock()
             ret.returncode = self.rc
             ret.stdout = self.out
             return ret
@@ -94,3 +151,51 @@ def test_bad_env_python(monkeypatch):
 def test_good_env_python(monkeypatch, capsys):
     good_exec = _get_absolute_python_interpreter(sys.executable)
     assert good_exec == sys.executable
+
+
+def test_find_python_interpreter_by_path(monkeypatch):
+    interpreter_path = sys.executable
+    assert interpreter_path == find_python_interpreter(interpreter_path)
+
+
+def test_find_python_interpreter_by_version(monkeypatch):
+    major = sys.version_info.major
+    minor = sys.version_info.minor
+    python_path = find_python_interpreter(f"python{major}.{minor}")
+    assert python_path == f"python{major}.{minor}" or f"Python\\{major}.{minor}" in python_path
+
+
+def test_find_python_interpreter_by_wrong_path_raises(monkeypatch):
+    interpreter_path = sys.executable + "99"
+    with pytest.raises(InterpreterResolutionError) as e:
+        find_python_interpreter(interpreter_path)
+        assert "like a path" in str(e)
+
+
+def test_find_python_interpreter_missing_on_path_raises(monkeypatch):
+    interpreter = "1.1"
+    with pytest.raises(InterpreterResolutionError) as e:
+        find_python_interpreter(interpreter)
+        assert "Python Launcher" in str(e)
+        assert "on your PATH" in str(e)
+
+
+def test_fetch_missing_python(monkeypatch, mocked_github_api):
+    def which(name):
+        return None
+
+    monkeypatch.setattr(shutil, "which", which)
+
+    major = sys.version_info.major
+    minor = sys.version_info.minor
+    target_python = f"{major}.{minor}"
+
+    python_path = find_python_interpreter(target_python, fetch_missing_python=True)
+    assert python_path is not None
+    assert target_python in python_path
+    assert str(pipx.paths.ctx.standalone_python_cachedir) in python_path
+    if WINDOWS:
+        assert python_path.endswith("python.exe")
+    else:
+        assert python_path.endswith("python3")
+    subprocess.run([python_path, "-c", "import sys; print(sys.executable)"], check=True)

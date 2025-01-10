@@ -1,10 +1,12 @@
+import sys
+from dataclasses import replace
 from pathlib import Path
 
-import pytest  # type: ignore
+import pytest  # type: ignore[import-not-found]
 
-import pipx.constants
 from helpers import assert_package_metadata, create_package_info_ref, run_pipx_cli
 from package_info import PKG
+from pipx import paths
 from pipx.pipx_metadata_file import PackageInfo, PipxMetadata
 from pipx.util import PipxError
 
@@ -18,6 +20,9 @@ TEST_PACKAGE1 = PackageInfo(
     app_paths=[Path("/usr/bin")],
     apps_of_dependencies=["dep1"],
     app_paths_of_dependencies={"dep1": [Path("bin")]},
+    man_pages=[str(Path("man1/testapp.1"))],
+    man_pages_of_dependencies=[str(Path("man1/dep1.1"))],
+    man_paths_of_dependencies={"dep1": [Path("man1/dep1.1")]},
     package_version="0.1.2",
 )
 TEST_PACKAGE2 = PackageInfo(
@@ -30,6 +35,9 @@ TEST_PACKAGE2 = PackageInfo(
     app_paths=[Path("/usr/bin")],
     apps_of_dependencies=["dep2"],
     app_paths_of_dependencies={"dep2": [Path("bin")]},
+    man_pages=[str(Path("man1/injapp.1"))],
+    man_pages_of_dependencies=[str(Path("man1/dep2.1"))],
+    man_paths_of_dependencies={"dep2": [Path("man1/dep2.1")]},
     package_version="6.7.8",
 )
 
@@ -41,6 +49,7 @@ def test_pipx_metadata_file_create(tmp_path):
     pipx_metadata = PipxMetadata(venv_dir)
     pipx_metadata.main_package = TEST_PACKAGE1
     pipx_metadata.python_version = "3.4.5"
+    pipx_metadata.source_interpreter = Path(sys.executable)
     pipx_metadata.venv_args = ["--system-site-packages"]
     pipx_metadata.injected_packages = {"injected": TEST_PACKAGE2}
     pipx_metadata.write()
@@ -60,9 +69,9 @@ def test_pipx_metadata_file_create(tmp_path):
 @pytest.mark.parametrize(
     "test_package",
     [
-        TEST_PACKAGE1._replace(include_apps=False),
-        TEST_PACKAGE1._replace(package=None),
-        TEST_PACKAGE1._replace(package_or_url=None),
+        replace(TEST_PACKAGE1, include_apps=False),
+        replace(TEST_PACKAGE1, package=None),
+        replace(TEST_PACKAGE1, package_or_url=None),
     ],
 )
 def test_pipx_metadata_file_validation(tmp_path, test_package):
@@ -72,6 +81,7 @@ def test_pipx_metadata_file_validation(tmp_path, test_package):
     pipx_metadata = PipxMetadata(venv_dir)
     pipx_metadata.main_package = test_package
     pipx_metadata.python_version = "3.4.5"
+    pipx_metadata.source_interpreter = Path(sys.executable)
     pipx_metadata.venv_args = ["--system-site-packages"]
     pipx_metadata.injected_packages = {}
 
@@ -80,21 +90,19 @@ def test_pipx_metadata_file_validation(tmp_path, test_package):
 
 
 def test_package_install(monkeypatch, tmp_path, pipx_temp_env):
-    pipx_venvs_dir = pipx.constants.PIPX_HOME / "venvs"
+    pipx_venvs_dir = paths.ctx.home / "venvs"
 
     run_pipx_cli(["install", PKG["pycowsay"]["spec"]])
     assert (pipx_venvs_dir / "pycowsay" / "pipx_metadata.json").is_file()
 
     pipx_metadata = PipxMetadata(pipx_venvs_dir / "pycowsay")
-    pycowsay_package_ref = create_package_info_ref(
-        "pycowsay", "pycowsay", pipx_venvs_dir
-    )
+    pycowsay_package_ref = create_package_info_ref("pycowsay", "pycowsay", pipx_venvs_dir)
     assert_package_metadata(pipx_metadata.main_package, pycowsay_package_ref)
     assert pipx_metadata.injected_packages == {}
 
 
 def test_package_inject(monkeypatch, tmp_path, pipx_temp_env):
-    pipx_venvs_dir = pipx.constants.PIPX_HOME / "venvs"
+    pipx_venvs_dir = paths.ctx.home / "venvs"
 
     run_pipx_cli(["install", PKG["pycowsay"]["spec"]])
     run_pipx_cli(["inject", "pycowsay", PKG["black"]["spec"]])
@@ -103,7 +111,5 @@ def test_package_inject(monkeypatch, tmp_path, pipx_temp_env):
     pipx_metadata = PipxMetadata(pipx_venvs_dir / "pycowsay")
 
     assert pipx_metadata.injected_packages.keys() == {"black"}
-    black_package_ref = create_package_info_ref(
-        "pycowsay", "black", pipx_venvs_dir, include_apps=False
-    )
+    black_package_ref = create_package_info_ref("pycowsay", "black", pipx_venvs_dir, include_apps=False)
     assert_package_metadata(pipx_metadata.injected_packages["black"], black_package_ref)

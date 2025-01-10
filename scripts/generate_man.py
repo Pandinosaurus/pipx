@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os.path
+import sys
 import textwrap
+from typing import cast
 
-from build_manpages.manpage import Manpage  # type: ignore
+from build_manpages.manpage import Manpage  # type: ignore[import-not-found]
 
 from pipx.main import get_command_parser
 
 
 def main():
-    parser = get_command_parser()
-    parser.man_short_description = parser.description.splitlines()[1]
+    sys.argv[0] = "pipx"
+    parser, _ = get_command_parser()
+    parser.man_short_description = cast(str, parser.description).splitlines()[1]  # type: ignore[attr-defined]
 
     manpage = Manpage(parser)
     body = str(manpage)
@@ -26,7 +28,7 @@ def main():
         .IR pipx (1)
         was written by Chad Smith and contributors.
         The project can be found online at
-        .UR https://pypa.github.io/pipx/
+        .UR https://pipx.pypa.io
         .UE
         .SH SEE ALSO
         .IR pip (1),

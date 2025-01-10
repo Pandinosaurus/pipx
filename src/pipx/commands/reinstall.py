@@ -1,11 +1,9 @@
-import importlib.util
 import sys
 from pathlib import Path
 from typing import List, Sequence
 
 from packaging.utils import canonicalize_name
 
-import pipx.shared_libs  # import instead of from so mockable in tests
 from pipx.commands.inject import inject_dep
 from pipx.commands.install import install
 from pipx.commands.uninstall import uninstall
@@ -13,7 +11,6 @@ from pipx.constants import (
     EXIT_CODE_OK,
     EXIT_CODE_REINSTALL_INVALID_PYTHON,
     EXIT_CODE_REINSTALL_VENV_NONEXISTENT,
-    PIPX_SHARED_LIBS,
     ExitCode,
 )
 from pipx.emojis import error, sleep
@@ -22,7 +19,14 @@ from pipx.venv import Venv, VenvContainer
 
 
 def reinstall(
-    *, venv_dir: Path, local_bin_dir: Path, python: str, verbose: bool
+    *,
+    venv_dir: Path,
+    local_bin_dir: Path,
+    local_man_dir: Path,
+    python: str,
+    verbose: bool,
+    force_reinstall_shared_libs: bool = False,
+    python_flag_passed: bool = False,
 ) -> ExitCode:
     """Returns pipx exit code."""
     if not venv_dir.exists():
@@ -41,19 +45,16 @@ def reinstall(
         return EXIT_CODE_REINSTALL_INVALID_PYTHON
 
     venv = Venv(venv_dir, verbose=verbose)
+    venv.check_upgrade_shared_libs(
+        pip_args=venv.pipx_metadata.main_package.pip_args, verbose=verbose, force_upgrade=force_reinstall_shared_libs
+    )
 
     if venv.pipx_metadata.main_package.package_or_url is not None:
         package_or_url = venv.pipx_metadata.main_package.package_or_url
     else:
         package_or_url = venv.main_package_name
 
-    if importlib.util.find_spec("pip") is None:
-        raise PipxError(
-            f"Can not find pip. You may encounter issues uninstalling packages. "
-            f"Remove {PIPX_SHARED_LIBS} and run 'pipx reinstall-all' to fix them."
-        )
-
-    uninstall(venv_dir, local_bin_dir, verbose)
+    uninstall(venv_dir, local_bin_dir, local_man_dir, verbose)
 
     # in case legacy original dir name
     venv_dir = venv_dir.with_name(canonicalize_name(venv_dir.name))
@@ -61,16 +62,20 @@ def reinstall(
     # install main package first
     install(
         venv_dir,
-        venv.main_package_name,
-        package_or_url,
+        [venv.main_package_name],
+        [package_or_url],
         local_bin_dir,
+        local_man_dir,
         python,
         venv.pipx_metadata.main_package.pip_args,
         venv.pipx_metadata.venv_args,
         verbose,
         force=True,
+        reinstall=True,
         include_dependencies=venv.pipx_metadata.main_package.include_dependencies,
+        preinstall_packages=[],
         suffix=venv.pipx_metadata.main_package.suffix,
+        python_flag_passed=python_flag_passed,
     )
 
     # now install injected packages
@@ -78,9 +83,7 @@ def reinstall(
         if injected_package.package_or_url is None:
             # This should never happen, but package_or_url is type
             #   Optional[str] so mypy thinks it could be None
-            raise PipxError(
-                f"Internal Error injecting package {injected_package} into {venv.name}"
-            )
+            raise PipxError(f"Internal Error injecting package {injected_package} into {venv.name}")
         inject_dep(
             venv_dir,
             injected_name,
@@ -99,34 +102,43 @@ def reinstall(
 def reinstall_all(
     venv_container: VenvContainer,
     local_bin_dir: Path,
+    local_man_dir: Path,
     python: str,
     verbose: bool,
     *,
     skip: Sequence[str],
+    python_flag_passed: bool = False,
 ) -> ExitCode:
     """Returns pipx exit code."""
-    pipx.shared_libs.shared_libs.upgrade(verbose=verbose)
-
     failed: List[str] = []
+    reinstalled: List[str] = []
+
+    # iterate on all packages and reinstall them
+    # for the first one, we also trigger
+    # a reinstall of shared libs beforehand
+    first_reinstall = True
     for venv_dir in venv_container.iter_venv_dirs():
         if venv_dir.name in skip:
             continue
         try:
-            package_exit = reinstall(
+            reinstall(
                 venv_dir=venv_dir,
                 local_bin_dir=local_bin_dir,
+                local_man_dir=local_man_dir,
                 python=python,
                 verbose=verbose,
+                force_reinstall_shared_libs=first_reinstall,
+                python_flag_passed=python_flag_passed,
             )
         except PipxError as e:
             print(e, file=sys.stderr)
             failed.append(venv_dir.name)
         else:
-            if package_exit != 0:
-                failed.append(venv_dir.name)
+            first_reinstall = False
+            reinstalled.append(venv_dir.name)
+    if len(reinstalled) == 0:
+        print(f"No packages reinstalled after running 'pipx reinstall-all' {sleep}")
     if len(failed) > 0:
-        raise PipxError(
-            f"The following package(s) failed to reinstall: {', '.join(failed)}"
-        )
+        raise PipxError(f"The following package(s) failed to reinstall: {', '.join(failed)}")
     # Any failure to install will raise PipxError, otherwise success
     return EXIT_CODE_OK

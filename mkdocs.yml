@@ -3,15 +3,30 @@ site_description: execute binaries from Python packages in isolated environments
 
 theme:
   name: "material"
-google_analytics:
-  - 'UA-90243909-2'
-  - 'auto'
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
 repo_name: pypa/pipx
 repo_url: https://github.com/pypa/pipx
 edit_uri: edit/main/docs/
+extra:
+  analytics:
+    provider: 'google'
+    property: 'UA-90243909-2'
+
 
 nav:
-  - Home: "index.md"
+  - Home: "README.md"
   - Installation: "installation.md"
   - Getting Started: "getting-started.md"
   - Docs: "docs.md"
@@ -24,4 +39,16 @@ nav:
   - Changelog: "changelog.md"
 
 markdown_extensions:
-  - admonition  #  note blocks, warning blocks -- https://github.com/mkdocs/mkdocs/issues/1659
+  - markdown_gfm_admonition  # GitHub's admonition (alert) syntax
+  - footnotes
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search:
+      lang: en
+  - gen-files:
+      scripts:
+        - scripts/gen_doc_pages.py
+  - macros

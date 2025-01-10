@@ -8,8 +8,10 @@
 
 import logging
 import re
+import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
@@ -23,7 +25,8 @@ logger = logging.getLogger(__name__)
 ARCHIVE_EXTENSIONS = (".whl", ".tar.gz", ".zip")
 
 
-class ParsedPackage(NamedTuple):
+@dataclass(frozen=True)
+class ParsedPackage:
     valid_pep508: Optional[Requirement]
     valid_url: Optional[str]
     valid_local_path: Optional[str]
@@ -73,24 +76,17 @@ def _parse_specifier(package_spec: str) -> ParsedPackage:
         else:
             raise PipxError(f"{package_path} does not exist")
 
-    # packaging currently (2020-07-19) only does basic syntax checks on URL.
-    #   Some examples of what it will not catch:
-    #       - invalid RCS string (e.g. "gat+https://...")
-    #       - non-existent scheme (e.g. "zzzzz://...")
+    # If this looks like a URL, treat it as such.
     if not valid_pep508:
-        try:
-            package_req = Requirement("notapackagename @ " + package_spec)
-        except InvalidRequirement:
-            # not a valid url
-            pass
-        else:
+        parsed_url = urllib.parse.urlsplit(package_spec)
+        if parsed_url.scheme and parsed_url.netloc:
             valid_url = package_spec
 
+    # Treat the input as a local path if it does not look like a PEP 508
+    # specifier nor a URL. In this case we want to split out the extra part.
     if not valid_pep508 and not valid_url:
         (package_path_str, package_extras_str) = _split_path_extras(package_spec)
-
         (package_path, package_path_exists) = _check_package_path(package_path_str)
-
         if package_path_exists:
             valid_local_path = str(package_path.resolve()) + package_extras_str
 
@@ -109,9 +105,7 @@ def _parse_specifier(package_spec: str) -> ParsedPackage:
     )
 
 
-def package_or_url_from_pep508(
-    requirement: Requirement, remove_version_specifiers: bool = False
-) -> str:
+def package_or_url_from_pep508(requirement: Requirement, remove_version_specifiers: bool = False) -> str:
     requirement.marker = None
     requirement.name = canonicalize_name(requirement.name)
     if remove_version_specifiers:
@@ -119,9 +113,7 @@ def package_or_url_from_pep508(
     return str(requirement)
 
 
-def _parsed_package_to_package_or_url(
-    parsed_package: ParsedPackage, remove_version_specifiers: bool
-) -> str:
+def _parsed_package_to_package_or_url(parsed_package: ParsedPackage, remove_version_specifiers: bool) -> str:
     if parsed_package.valid_pep508 is not None:
         if parsed_package.valid_pep508.marker is not None:
             logger.warning(
@@ -148,9 +140,7 @@ def _parsed_package_to_package_or_url(
     return package_or_url
 
 
-def parse_specifier_for_install(
-    package_spec: str, pip_args: List[str]
-) -> Tuple[str, List[str]]:
+def parse_specifier_for_install(package_spec: str, pip_args: List[str]) -> Tuple[str, List[str]]:
     """Return package_or_url and pip_args suitable for pip install
 
     Specifically:
@@ -159,9 +149,7 @@ def parse_specifier_for_install(
     * Convert local paths to absolute paths
     """
     parsed_package = _parse_specifier(package_spec)
-    package_or_url = _parsed_package_to_package_or_url(
-        parsed_package, remove_version_specifiers=False
-    )
+    package_or_url = _parsed_package_to_package_or_url(parsed_package, remove_version_specifiers=False)
     if "--editable" in pip_args and not parsed_package.valid_local_path:
         logger.warning(
             pipx_wrap(
@@ -175,7 +163,27 @@ def parse_specifier_for_install(
         )
         pip_args.remove("--editable")
 
-    return (package_or_url, pip_args)
+    for index, option in enumerate(pip_args):
+        if not option.startswith(("-c", "--constraint")):
+            continue
+
+        if option in ("-c", "--constraint"):
+            argument_index = index + 1
+            if argument_index < len(pip_args):
+                constraints_file = pip_args[argument_index]
+                pip_args[argument_index] = str(Path(constraints_file).expanduser().resolve())
+
+        else:  # option == "--constraint=some_path"
+            option_list = option.split("=")
+
+            if len(option_list) == 2:
+                key, value = option_list
+                value_path = Path(value).expanduser().resolve()
+                pip_args[index] = f"{key}={value_path}"
+
+        break
+
+    return package_or_url, pip_args
 
 
 def parse_specifier_for_metadata(package_spec: str) -> str:
@@ -186,10 +194,7 @@ def parse_specifier_for_metadata(package_spec: str) -> str:
     * Convert local paths to absolute paths
     """
     parsed_package = _parse_specifier(package_spec)
-    package_or_url = _parsed_package_to_package_or_url(
-        parsed_package, remove_version_specifiers=False
-    )
-    return package_or_url
+    return _parsed_package_to_package_or_url(parsed_package, remove_version_specifiers=False)
 
 
 def parse_specifier_for_upgrade(package_spec: str) -> str:
@@ -201,10 +206,7 @@ def parse_specifier_for_upgrade(package_spec: str) -> str:
     * Convert local paths to absolute paths
     """
     parsed_package = _parse_specifier(package_spec)
-    package_or_url = _parsed_package_to_package_or_url(
-        parsed_package, remove_version_specifiers=True
-    )
-    return package_or_url
+    return _parsed_package_to_package_or_url(parsed_package, remove_version_specifiers=True)
 
 
 def get_extras(package_spec: str) -> Set[str]:

@@ -1,15 +1,18 @@
 import json
 import logging
 import re
+import shutil
 import time
 from pathlib import Path
-from subprocess import CompletedProcess
-from typing import Dict, Generator, List, NoReturn, Optional, Set
+from typing import TYPE_CHECKING, Dict, Generator, List, NoReturn, Optional, Set
+
+if TYPE_CHECKING:
+    from subprocess import CompletedProcess
 
 try:
     from importlib.metadata import Distribution, EntryPoint
 except ImportError:
-    from importlib_metadata import Distribution, EntryPoint  # type: ignore
+    from importlib_metadata import Distribution, EntryPoint  # type: ignore[import-not-found,no-redef]
 
 from packaging.utils import canonicalize_name
 
@@ -76,20 +79,14 @@ class VenvContainer:
         """Return the expected venv path for given `package_name`."""
         return self._root.joinpath(canonicalize_name(package_name))
 
-    def verify_shared_libs(self) -> None:
-        for p in self.iter_venv_dirs():
-            Venv(p)
-
 
 class Venv:
     """Abstraction for a virtual environment with various useful methods for pipx"""
 
-    def __init__(
-        self, path: Path, *, verbose: bool = False, python: str = DEFAULT_PYTHON
-    ) -> None:
+    def __init__(self, path: Path, *, verbose: bool = False, python: str = DEFAULT_PYTHON) -> None:
         self.root = path
         self.python = python
-        self.bin_path, self.python_path = get_venv_paths(self.root)
+        self.bin_path, self.python_path, self.man_path = get_venv_paths(self.root)
         self.pipx_metadata = PipxMetadata(venv_dir=path)
         self.verbose = verbose
         self.do_animation = not verbose
@@ -98,12 +95,21 @@ class Venv:
         except StopIteration:
             self._existing = False
 
+    def check_upgrade_shared_libs(self, verbose: bool, pip_args: List[str], force_upgrade: bool = False):
+        """
+        If necessary, run maintenance tasks to keep the shared libs up-to-date.
+
+        This can trigger `pip install`/`pip install --upgrade` operations,
+        so we expect the caller to provide sensible `pip_args`
+        ( provided by the user in the current CLI call
+        or retrieved from the metadata of a previous installation)
+        """
         if self._existing and self.uses_shared_libs:
             if shared_libs.is_valid:
-                if shared_libs.needs_upgrade:
-                    shared_libs.upgrade(verbose=verbose)
+                if force_upgrade or shared_libs.needs_upgrade:
+                    shared_libs.upgrade(verbose=verbose, pip_args=pip_args)
             else:
-                shared_libs.create(verbose)
+                shared_libs.create(verbose=verbose, pip_args=pip_args)
 
             if not shared_libs.is_valid:
                 raise PipxError(
@@ -121,10 +127,7 @@ class Venv:
     @property
     def name(self) -> str:
         if self.pipx_metadata.main_package.package is not None:
-            venv_name = (
-                f"{self.pipx_metadata.main_package.package}"
-                f"{self.pipx_metadata.main_package.suffix}"
-            )
+            venv_name = f"{self.pipx_metadata.main_package.package}{self.pipx_metadata.main_package.suffix}"
         else:
             venv_name = self.root.name
         return venv_name
@@ -142,9 +145,7 @@ class Venv:
     def package_metadata(self) -> Dict[str, PackageInfo]:
         return_dict = self.pipx_metadata.injected_packages.copy()
         if self.pipx_metadata.main_package.package is not None:
-            return_dict[
-                self.pipx_metadata.main_package.package
-            ] = self.pipx_metadata.main_package
+            return_dict[self.pipx_metadata.main_package.package] = self.pipx_metadata.main_package
         return return_dict
 
     @property
@@ -156,27 +157,37 @@ class Venv:
         else:
             return self.pipx_metadata.main_package.package
 
-    def create_venv(self, venv_args: List[str], pip_args: List[str]) -> None:
+    def create_venv(self, venv_args: List[str], pip_args: List[str], override_shared: bool = False) -> None:
+        """
+        override_shared -- Override installing shared libraries to the pipx shared directory (default False)
+        """
+        logger.info("Creating virtual environment")
         with animate("creating virtual environment", self.do_animation):
-            cmd = [self.python, "-m", "venv", "--without-pip"]
-            venv_process = run_subprocess(cmd + venv_args + [str(self.root)])
+            cmd = [self.python, "-m", "venv"]
+            if not override_shared:
+                cmd.append("--without-pip")
+            venv_process = run_subprocess(cmd + venv_args + [str(self.root)], run_dir=str(self.root))
         subprocess_post_check(venv_process)
 
-        shared_libs.create(self.verbose)
-        pipx_pth = get_site_packages(self.python_path) / PIPX_SHARED_PTH
-        # write path pointing to the shared libs site-packages directory
-        # example pipx_pth location:
-        #   ~/.local/pipx/venvs/black/lib/python3.8/site-packages/pipx_shared.pth
-        # example shared_libs.site_packages location:
-        #   ~/.local/pipx/shared/lib/python3.6/site-packages
-        #
-        # https://docs.python.org/3/library/site.html
-        # A path configuration file is a file whose name has the form 'name.pth'.
-        # its contents are additional items (one per line) to be added to sys.path
-        pipx_pth.write_text(f"{shared_libs.site_packages}\n", encoding="utf-8")
+        shared_libs.create(verbose=self.verbose, pip_args=pip_args)
+        if not override_shared:
+            pipx_pth = get_site_packages(self.python_path) / PIPX_SHARED_PTH
+            # write path pointing to the shared libs site-packages directory
+            # example pipx_pth location:
+            #   ~/.local/share/pipx/venvs/black/lib/python3.8/site-packages/pipx_shared.pth
+            # example shared_libs.site_packages location:
+            #   ~/.local/share/pipx/shared/lib/python3.6/site-packages
+            #
+            # https://docs.python.org/3/library/site.html
+            # A path configuration file is a file whose name has the form 'name.pth'.
+            # its contents are additional items (one per line) to be added to sys.path
+            pipx_pth.write_text(f"{shared_libs.site_packages}\n", encoding="utf-8")
 
         self.pipx_metadata.venv_args = venv_args
         self.pipx_metadata.python_version = self.get_python_version()
+        source_interpreter = shutil.which(self.python)
+        if source_interpreter:
+            self.pipx_metadata.source_interpreter = Path(source_interpreter)
 
     def safe_to_remove(self) -> bool:
         return not self._existing
@@ -197,20 +208,21 @@ class Venv:
 
     def upgrade_packaging_libraries(self, pip_args: List[str]) -> None:
         if self.uses_shared_libs:
-            shared_libs.upgrade(verbose=self.verbose)
+            shared_libs.upgrade(pip_args=pip_args, verbose=self.verbose)
         else:
             # TODO: setuptools and wheel? Original code didn't bother
             # but shared libs code does.
-            self._upgrade_package_no_metadata("pip", pip_args)
+            self.upgrade_package_no_metadata("pip", pip_args)
 
     def uninstall_package(self, package: str, was_injected: bool = False):
         try:
+            logger.info("Uninstalling %s", package)
             with animate(f"uninstalling {package}", self.do_animation):
                 cmd = ["uninstall", "-y"] + [package]
                 self._run_pip(cmd)
         except PipxError as e:
-            logging.info(e)
-            raise PipxError(f"Error uninstalling {package}.")
+            logger.info(e)
+            raise PipxError(f"Error uninstalling {package}.") from None
 
         if was_injected:
             self.pipx_metadata.injected_packages.pop(package)
@@ -230,31 +242,29 @@ class Venv:
         package_or_url = fix_package_name(package_or_url, package_name)
 
         # check syntax and clean up spec and pip_args
-        (package_or_url, pip_args) = parse_specifier_for_install(
-            package_or_url, pip_args
-        )
+        (package_or_url, pip_args) = parse_specifier_for_install(package_or_url, pip_args)
 
-        with animate(
-            f"installing {full_package_description(package_name, package_or_url)}",
-            self.do_animation,
-        ):
+        logger.info("Installing %s", package_descr := full_package_description(package_name, package_or_url))
+        with animate(f"installing {package_descr}", self.do_animation):
             # do not use -q with `pip install` so subprocess_post_check_pip_errors
             #   has more information to analyze in case of failure.
-            cmd = (
-                [str(self.python_path), "-m", "pip", "install"]
-                + pip_args
-                + [package_or_url]
-            )
+            cmd = [
+                str(self.python_path),
+                "-m",
+                "pip",
+                "--no-input",
+                "install",
+                *pip_args,
+                package_or_url,
+            ]
             # no logging because any errors will be specially logged by
             #   subprocess_post_check_handle_pip_error()
-            pip_process = run_subprocess(cmd, log_stdout=False, log_stderr=False)
+            pip_process = run_subprocess(cmd, log_stdout=False, log_stderr=False, run_dir=str(self.root))
         subprocess_post_check_handle_pip_error(pip_process)
         if pip_process.returncode:
-            raise PipxError(
-                f"Error installing {full_package_description(package_name, package_or_url)}."
-            )
+            raise PipxError(f"Error installing {full_package_description(package_name, package_or_url)}.")
 
-        self._update_package_metadata(
+        self.update_package_metadata(
             package_name=package_name,
             package_or_url=package_or_url,
             pip_args=pip_args,
@@ -274,12 +284,41 @@ class Venv:
                 wrap_message=False,
             )
 
+    def install_unmanaged_packages(self, requirements: List[str], pip_args: List[str]) -> None:
+        """Install packages in the venv, but do not record them in the metadata."""
+
+        # Note: We want to install everything at once, as that lets
+        # pip resolve conflicts correctly.
+        logger.info("Installing %s", package_descr := ", ".join(requirements))
+        with animate(f"installing {package_descr}", self.do_animation):
+            # do not use -q with `pip install` so subprocess_post_check_pip_errors
+            #   has more information to analyze in case of failure.
+            cmd = [
+                str(self.python_path),
+                "-m",
+                "pip",
+                "--no-input",
+                "install",
+                *pip_args,
+                *requirements,
+            ]
+            # no logging because any errors will be specially logged by
+            #   subprocess_post_check_handle_pip_error()
+            pip_process = run_subprocess(cmd, log_stdout=False, log_stderr=False, run_dir=str(self.root))
+        subprocess_post_check_handle_pip_error(pip_process)
+        if pip_process.returncode:
+            raise PipxError(f"Error installing {', '.join(requirements)}.")
+
     def install_package_no_deps(self, package_or_url: str, pip_args: List[str]) -> str:
-        with animate(
-            f"determining package name from {package_or_url!r}", self.do_animation
-        ):
+        with animate(f"determining package name from {package_or_url!r}", self.do_animation):
             old_package_set = self.list_installed_packages()
-            cmd = ["install"] + ["--no-dependencies"] + pip_args + [package_or_url]
+            cmd = [
+                "--no-input",
+                "install",
+                "--no-dependencies",
+                *pip_args,
+                package_or_url,
+            ]
             pip_process = self._run_pip(cmd)
         subprocess_post_check(pip_process, raise_error=False)
         if pip_process.returncode:
@@ -306,19 +345,13 @@ class Venv:
 
         return package_name
 
-    def get_venv_metadata_for_package(
-        self, package_name: str, package_extras: Set[str]
-    ) -> VenvMetadata:
+    def get_venv_metadata_for_package(self, package_name: str, package_extras: Set[str]) -> VenvMetadata:
         data_start = time.time()
-        venv_metadata = inspect_venv(
-            package_name, package_extras, self.bin_path, self.python_path
-        )
-        logger.info(
-            f"get_venv_metadata_for_package: {1e3*(time.time()-data_start):.0f}ms"
-        )
+        venv_metadata = inspect_venv(package_name, package_extras, self.bin_path, self.python_path, self.man_path)
+        logger.info(f"get_venv_metadata_for_package: {1e3*(time.time()-data_start):.0f}ms")
         return venv_metadata
 
-    def _update_package_metadata(
+    def update_package_metadata(
         self,
         package_name: str,
         package_or_url: str,
@@ -327,10 +360,9 @@ class Venv:
         include_apps: bool,
         is_main_package: bool,
         suffix: str = "",
+        pinned: bool = False,
     ) -> None:
-        venv_package_metadata = self.get_venv_metadata_for_package(
-            package_name, get_extras(package_or_url)
-        )
+        venv_package_metadata = self.get_venv_metadata_for_package(package_name, get_extras(package_or_url))
         package_info = PackageInfo(
             package=package_name,
             package_or_url=parse_specifier_for_metadata(package_or_url),
@@ -341,8 +373,13 @@ class Venv:
             app_paths=venv_package_metadata.app_paths,
             apps_of_dependencies=venv_package_metadata.apps_of_dependencies,
             app_paths_of_dependencies=venv_package_metadata.app_paths_of_dependencies,
+            man_pages=venv_package_metadata.man_pages,
+            man_paths=venv_package_metadata.man_paths,
+            man_pages_of_dependencies=venv_package_metadata.man_pages_of_dependencies,
+            man_paths_of_dependencies=venv_package_metadata.man_paths_of_dependencies,
             package_version=venv_package_metadata.package_version,
             suffix=suffix,
+            pinned=pinned,
         )
         if is_main_package:
             self.pipx_metadata.main_package = package_info
@@ -356,8 +393,7 @@ class Venv:
 
     def list_installed_packages(self, not_required=False) -> Set[str]:
         cmd_run = run_subprocess(
-            [str(self.python_path), "-m", "pip", "list", "--format=json"]
-            + (["--not-required"] if not_required else [])
+            [str(self.python_path), "-m", "pip", "list", "--format=json"] + (["--not-required"] if not_required else [])
         )
         pip_list = json.loads(cmd_run.stdout.strip())
         return {x["name"] for x in pip_list}
@@ -365,13 +401,16 @@ class Venv:
     def _find_entry_point(self, app: str) -> Optional[EntryPoint]:
         if not self.python_path.exists():
             return None
-        dists = Distribution.discover(
-            name=self.main_package_name, path=[str(get_site_packages(self.python_path))]
-        )
+        dists = Distribution.discover(name=self.main_package_name, path=[str(get_site_packages(self.python_path))])
         for dist in dists:
             for ep in dist.entry_points:
-                if ep.group == "pipx.run" and ep.name == app:
-                    return ep
+                if ep.group == "pipx.run":
+                    if ep.name == app:
+                        return ep
+                    # Try to infer app name from dist's metadata if given
+                    # local path
+                    if Path(app).exists() and dist.metadata["Name"] == ep.name:
+                        return ep
         return None
 
     def run_app(self, app: str, filename: str, app_args: List[str]) -> NoReturn:
@@ -386,12 +425,9 @@ class Venv:
         # "entry_point.module" and "entry_point.attr" instead.
         match = _entry_point_value_pattern.match(entry_point.value)
         assert match is not None, "invalid entry point"
+        logger.info("Using discovered entry point for 'pipx run'")
         module, attr = match.group("module", "attr")
-        code = (
-            f"import sys, {module}\n"
-            f"sys.argv[0] = {entry_point.name!r}\n"
-            f"sys.exit({module}.{attr}())\n"
-        )
+        code = f"import sys, {module}\nsys.argv[0] = {entry_point.name!r}\nsys.exit({module}.{attr}())\n"
         exec_app([str(self.python_path), "-c", code] + app_args)
 
     def has_app(self, app: str, filename: str) -> bool:
@@ -399,16 +435,13 @@ class Venv:
             return True
         return (self.bin_path / filename).is_file()
 
-    def _upgrade_package_no_metadata(
-        self, package_name: str, pip_args: List[str]
-    ) -> None:
-        with animate(
-            f"upgrading {full_package_description(package_name, package_name)}",
-            self.do_animation,
-        ):
-            pip_process = self._run_pip(
-                ["install"] + pip_args + ["--upgrade", package_name]
-            )
+    def has_package(self, package_name: str) -> bool:
+        return bool(list(Distribution.discover(name=package_name, path=[str(get_site_packages(self.python_path))])))
+
+    def upgrade_package_no_metadata(self, package_name: str, pip_args: List[str]) -> None:
+        logger.info("Upgrading %s", package_descr := full_package_description(package_name, package_name))
+        with animate(f"upgrading {package_descr}", self.do_animation):
+            pip_process = self._run_pip(["--no-input", "install"] + pip_args + ["--upgrade", package_name])
         subprocess_post_check(pip_process)
 
     def upgrade_package(
@@ -421,16 +454,12 @@ class Venv:
         is_main_package: bool,
         suffix: str = "",
     ) -> None:
-        with animate(
-            f"upgrading {full_package_description(package_name, package_or_url)}",
-            self.do_animation,
-        ):
-            pip_process = self._run_pip(
-                ["install"] + pip_args + ["--upgrade", package_or_url]
-            )
+        logger.info("Upgrading %s", package_descr := full_package_description(package_name, package_or_url))
+        with animate(f"upgrading {package_descr}", self.do_animation):
+            pip_process = self._run_pip(["--no-input", "install"] + pip_args + ["--upgrade", package_or_url])
         subprocess_post_check(pip_process)
 
-        self._update_package_metadata(
+        self.update_package_metadata(
             package_name=package_name,
             package_or_url=package_or_url,
             pip_args=pip_args,
@@ -444,15 +473,13 @@ class Venv:
         cmd = [str(self.python_path), "-m", "pip"] + cmd
         if not self.verbose:
             cmd.append("-q")
-        return run_subprocess(cmd)
+        return run_subprocess(cmd, run_dir=str(self.root))
 
     def run_pip_get_exit_code(self, cmd: List[str]) -> ExitCode:
         cmd = [str(self.python_path), "-m", "pip"] + cmd
         if not self.verbose:
             cmd.append("-q")
-        returncode = run_subprocess(
-            cmd, capture_stdout=False, capture_stderr=False
-        ).returncode
+        returncode = run_subprocess(cmd, capture_stdout=False, capture_stderr=False).returncode
         if returncode:
             cmd_str = " ".join(str(c) for c in cmd)
             logger.error(f"{cmd_str!r} failed")
